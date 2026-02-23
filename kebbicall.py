@@ -1,6 +1,4 @@
-import eventlet
 
-eventlet.monkey_patch()
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, join_room, emit
 import time, uuid, threading
@@ -15,7 +13,7 @@ app.config['SECRET_KEY'] = 'aljazari-move-only'
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="eventlet",
+    async_mode="threading",
     ping_timeout=25,
     ping_interval=10,
 )
