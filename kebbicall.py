@@ -6,6 +6,8 @@ import json, requests, os, pathlib
 import re, unicodedata
 from pathlib import Path
 import random
+import eventlet
+eventlet.monkey_patch()
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'aljazari-move-only'
@@ -13,7 +15,7 @@ app.config['SECRET_KEY'] = 'aljazari-move-only'
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
-    async_mode="threading",
+    async_mode="eventlet",
     ping_timeout=25,
     ping_interval=10,
 )
