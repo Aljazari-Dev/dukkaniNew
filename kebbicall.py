@@ -1212,8 +1212,17 @@ def _regenerate_and_persist_catalog_prompt(items: list) -> str:
     return text
 
 CATALOG_ITEMS = _load_catalog_items()
-CATALOG_PROMPT = _regenerate_and_persist_catalog_prompt(CATALOG_ITEMS)
 
+# ✅ لا تسوي GPT call وقت الإقلاع
+try:
+    if CATALOG_PROMPT_FILE.exists():
+        CATALOG_PROMPT = CATALOG_PROMPT_FILE.read_text(encoding="utf-8")
+    else:
+        CATALOG_PROMPT = _fallback_catalog_prompt(CATALOG_ITEMS)
+        CATALOG_PROMPT_FILE.write_text(CATALOG_PROMPT, encoding="utf-8")
+except Exception:
+    CATALOG_PROMPT = _fallback_catalog_prompt(CATALOG_ITEMS)
+    
 def _load_catalog_prompt_from_disk() -> str:
     try:
         if CATALOG_PROMPT_FILE.exists():
