@@ -276,8 +276,130 @@ def ring_timeout(call_id: str):
 # ===================== REST (اختياري للاختبار) =====================
 @app.route("/")
 def index():
-    return jsonify({"status": "ok", "time": int(time.time())})
+    return """
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 
+<title>Arabic Numbers Test</title>
+
+<style>
+    body {
+        font-family: system-ui, Arial, sans-serif;
+        background: #f5f6f8;
+        margin: 0;
+        padding: 30px;
+        direction: rtl;
+    }
+
+    .box {
+        max-width: 520px;
+        margin: auto;
+        background: white;
+        padding: 24px;
+        border-radius: 16px;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+    }
+
+    h2 {
+        margin-top: 0;
+        text-align: center;
+    }
+
+    label {
+        display: block;
+        margin-top: 18px;
+        margin-bottom: 8px;
+        font-weight: bold;
+    }
+
+    input {
+        width: 100%;
+        padding: 14px;
+        font-size: 22px;
+        border: 1px solid #ccc;
+        border-radius: 10px;
+        box-sizing: border-box;
+        direction: ltr;
+        text-align: center;
+    }
+
+    .hint {
+        font-size: 14px;
+        color: #666;
+        margin-top: 6px;
+    }
+
+    .result {
+        margin-top: 22px;
+        padding: 14px;
+        background: #f0f0f0;
+        border-radius: 10px;
+        direction: ltr;
+        text-align: left;
+        font-size: 16px;
+    }
+</style>
+</head>
+
+<body>
+
+<div class="box">
+    <h2>اختبار إدخال الأرقام</h2>
+
+    <label>مربع يقبل الأرقام العربية فقط</label>
+    <input 
+        id="arabicOnly"
+        type="text"
+        inputmode="numeric"
+        placeholder="مثال: ٠٧٧٠١٢٣٤٥٦٧"
+    >
+    <div class="hint">هذا الحقل يقبل فقط: ٠ ١ ٢ ٣ ٤ ٥ ٦ ٧ ٨ ٩</div>
+
+    <label>مربع يقبل الأرقام العربية والإنكليزية</label>
+    <input 
+        id="arabicEnglish"
+        type="text"
+        inputmode="numeric"
+        placeholder="مثال: ٠٧٧٠١٢٣٤٥٦٧ أو 07701234567"
+    >
+    <div class="hint">هذا الحقل يقبل: ٠١٢٣٤٥٦٧٨٩ و 0123456789</div>
+
+    <div class="result">
+        <b>Arabic Only:</b>
+        <span id="arabicOnlyResult"></span>
+        <br>
+        <b>Arabic + English:</b>
+        <span id="arabicEnglishResult"></span>
+    </div>
+</div>
+
+<script>
+const arabicDigitsOnlyRegex = /[^٠-٩]/g;
+const arabicAndEnglishDigitsRegex = /[^٠-٩0-9]/g;
+
+const arabicOnlyInput = document.getElementById("arabicOnly");
+const arabicEnglishInput = document.getElementById("arabicEnglish");
+
+const arabicOnlyResult = document.getElementById("arabicOnlyResult");
+const arabicEnglishResult = document.getElementById("arabicEnglishResult");
+
+arabicOnlyInput.addEventListener("input", function () {
+    this.value = this.value.replace(arabicDigitsOnlyRegex, "");
+    arabicOnlyResult.textContent = this.value;
+});
+
+arabicEnglishInput.addEventListener("input", function () {
+    this.value = this.value.replace(arabicAndEnglishDigitsRegex, "");
+    arabicEnglishResult.textContent = this.value;
+});
+</script>
+
+</body>
+</html>
+""".strip()
 # ✅ endpoint من movement_server
 @app.route("/ping")
 def ping():
