@@ -344,20 +344,22 @@ input {
         id="arabicOnly"
         type="tel"
         inputmode="numeric"
-        pattern="[٠-٩]*"
+        pattern="[0-9٠-٩۰-۹]*"
+        lang="ar"
         autocomplete="off"
         autocorrect="off"
         spellcheck="false"
         placeholder="مثال: ٠٧٧٠١٢٣٤٥٦٧"
     >
-    <div class="hint">هذا الحقل يقبل فقط الأرقام العربية: ٠١٢٣٤٥٦٧٨٩</div>
+    <div class="hint">حتى إذا ضغطت أرقام إنكليزية من كيبورد الروبوت، تتحول هنا إلى أرقام عربية.</div>
 
     <label>مربع يقبل الأرقام العربية والإنكليزية</label>
     <input
         id="arabicEnglish"
         type="tel"
         inputmode="numeric"
-        pattern="[0-9٠-٩]*"
+        pattern="[0-9٠-٩۰-۹]*"
+        lang="en"
         autocomplete="off"
         autocorrect="off"
         spellcheck="false"
@@ -370,12 +372,56 @@ input {
 const arabicOnlyInput = document.getElementById("arabicOnly");
 const arabicEnglishInput = document.getElementById("arabicEnglish");
 
+const englishToArabicDigits = {
+    "0": "٠",
+    "1": "١",
+    "2": "٢",
+    "3": "٣",
+    "4": "٤",
+    "5": "٥",
+    "6": "٦",
+    "7": "٧",
+    "8": "٨",
+    "9": "٩",
+
+    "۰": "٠",
+    "۱": "١",
+    "۲": "٢",
+    "۳": "٣",
+    "۴": "٤",
+    "۵": "٥",
+    "۶": "٦",
+    "۷": "٧",
+    "۸": "٨",
+    "۹": "٩"
+};
+
+function forceArabicDigitsOnly(value) {
+    return value
+        .replace(/[0-9۰-۹]/g, function(digit) {
+            return englishToArabicDigits[digit];
+        })
+        .replace(/[^٠-٩]/g, "");
+}
+
+function allowArabicAndEnglishDigitsOnly(value) {
+    return value.replace(/[^0-9٠-٩۰-۹]/g, "");
+}
+
 arabicOnlyInput.addEventListener("input", function () {
-    this.value = this.value.replace(/[^٠-٩]/g, "");
+    const cursor = this.selectionStart;
+    this.value = forceArabicDigitsOnly(this.value);
+    try {
+        this.setSelectionRange(cursor, cursor);
+    } catch(e) {}
 });
 
 arabicEnglishInput.addEventListener("input", function () {
-    this.value = this.value.replace(/[^0-9٠-٩]/g, "");
+    const cursor = this.selectionStart;
+    this.value = allowArabicAndEnglishDigitsOnly(this.value);
+    try {
+        this.setSelectionRange(cursor, cursor);
+    } catch(e) {}
 });
 </script>
 
