@@ -1,34 +1,22 @@
-# Al Jazari Kebbi backend
+# Al Jazari Kebbi Backend — Gemini Live v1.1
 
-This replaces the perfume/OpenAI chat layer with:
+Roles:
+- Admin dashboard and Al Jazari content storage.
+- Fresh Gemini Live ephemeral-token provisioning for the robot.
+- Existing Socket.IO/WebRTC call signaling.
+- Existing remote movement signaling.
 
-- Gemini Live ephemeral-token bootstrap for the Kebbi Android client.
-- Small password-protected Al Jazari content dashboard.
-- Existing Socket.IO call signaling / WebRTC routing.
-- Existing remote movement protocol.
+The backend no longer uses the old perfume/OpenAI chat/TTS conversation path.
 
-## Render environment variables
-
-Required:
-
-- `GEMINI_API_KEY` — Google Gemini API key (server only).
-- `ADMIN_USERNAME` — dashboard username.
-- `ADMIN_PASSWORD` — dashboard password.
-- `FLASK_SECRET_KEY` — long random value.
-- `ROBOT_API_KEY` — must match `Config.ROBOT_API_KEY` in the Android app.
-- `DATA_DIR=/var/data` — recommended when using a Render persistent disk.
-
-Optional:
-
-- `GEMINI_LIVE_MODEL=gemini-3.8-live`
+## Required Render environment variables
+- `ADMIN_USERNAME`
+- `ADMIN_PASSWORD`
+- `FLASK_SECRET_KEY`
+- `GEMINI_API_KEY`
+- `GEMINI_LIVE_MODEL` (recommended current value: `gemini-3.8-live`)
+- `ROBOT_API_KEY`
+- `DATA_DIR=/var/data`
 - `COOKIE_SECURE=1`
 
-Start command:
-
-`gunicorn -k eventlet -w 1 kebbicall:app`
-
-Dashboard: `/dashboard`
-Health: `/ping`
-Robot bootstrap: `/api/robot/bootstrap`
-
-The photo activity remains on its existing `photo-enh.onrender.com/send-image` endpoint and is intentionally not changed here.
+## Ephemeral token change in v1.1
+Token provisioning intentionally uses the minimal one-use token payload (`uses`, `expireTime`, `newSessionExpireTime`). The Live model/config is sent by the robot in the WebSocket setup message. This avoids the `Unknown name "liveConnectConstraints"` provisioning failure seen on the deployed service.

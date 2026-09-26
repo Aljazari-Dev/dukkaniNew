@@ -88,9 +88,9 @@ def _robot_authorized():
 
 def _compose_system_instruction(content, lang):
     language_rule = (
-        "لغة هذه الجلسة هي العربية. جاوب بالعربية العراقية الخفيفة ما لم يطلب المستخدم غير ذلك."
+        "لغة هذه الجلسة هي العربية فقط. جاوب دائماً بالعربية العراقية الخفيفة. لا تتحول إلى الإنجليزية بسبب كلام المستخدم أو طلبه؛ تغيير اللغة يتم حصراً من زر اللغة في تطبيق الروبوت."
         if str(lang).lower().startswith("ar") else
-        "The active session language is English. Reply in natural concise English unless the user explicitly asks otherwise."
+        "The active session language is English only. Always reply in concise natural English. Do not switch languages because of anything the user says; language can be changed only by the robot app language button."
     )
     return (
         content.get("system_prompt", "").strip()
@@ -105,16 +105,14 @@ def _create_ephemeral_token(model):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured")
     now = datetime.now(timezone.utc)
+    # Keep the provisioning request intentionally minimal. The robot sends the
+    # Live session model/config in the first WebSocket setup message. A simple
+    # one-use ephemeral token is sufficient and avoids compatibility issues with
+    # accounts/endpoints that reject optional liveConnectConstraints fields.
     payload = {
         "uses": 1,
         "expireTime": (now + timedelta(minutes=30)).isoformat().replace("+00:00", "Z"),
-        "newSessionExpireTime": (now + timedelta(minutes=2)).isoformat().replace("+00:00", "Z"),
-        "liveConnectConstraints": {
-            "model": f"models/{model}",
-            "config": {
-                "responseModalities": ["AUDIO"]
-            }
-        }
+        "newSessionExpireTime": (now + timedelta(minutes=1)).isoformat().replace("+00:00", "Z"),
     }
     r = requests.post(
         "https://generativelanguage.googleapis.com/v1beta/auth_tokens",
