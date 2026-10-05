@@ -1,7 +1,7 @@
 import eventlet
 eventlet.monkey_patch()
 
-from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string
+from flask import Flask, request, jsonify, session, redirect, url_for, render_template_string, send_from_directory
 from flask_socketio import SocketIO, join_room, emit
 from functools import wraps
 from pathlib import Path
@@ -14,6 +14,7 @@ import threading
 import time
 import uuid
 import requests
+import re
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY") or os.urandom(32).hex()
@@ -32,13 +33,15 @@ socketio = SocketIO(
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CONTENT_FILE = DATA_DIR / "aljazari_content.json"
+ROBOT_MEDIA_DIR = DATA_DIR / "robot_media"
+ROBOT_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 ROBOT_API_KEY = os.getenv("ROBOT_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_LIVE_MODEL = os.getenv("GEMINI_LIVE_MODEL", "gemini-3.8-live")
-CONTENT_SCHEMA_VERSION = 2
+CONTENT_SCHEMA_VERSION = 3
 
 EDU_ROBOT_FIELDS = [
     "enabled", "name", "aliases", "availability", "overview", "technical",
@@ -71,7 +74,8 @@ DEFAULT_SYSTEM_PROMPT = """أنت كيبي، روبوت شركة الجزري ا
 
 أوامر كيبي:
 - عند طلب اتصال خدمة العملاء استخدم أداة call_customer_service.
-- عند طلب صورة استخدم أداة take_photo.
+- إذا المستخدم يريد من كيبي أن تلتقط له صورة بالكاميرا استخدم أداة take_photo.
+- إذا المستخدم يطلب مشاهدة صورة/شكل أحد الروبوتات التعليمية، استخدم أداة show_robot_image ومرّر اسم الروبوت. لا تستخدم take_photo لهذا النوع من الطلب.
 - عند طلب الرقص استخدم أداة dance.
 - عند طلب المصافحة استخدم أداة handshake.
 - عند سؤال المستخدم إذا تعرفه أو منو هو استخدم أداة recognize_face.
@@ -92,6 +96,7 @@ def _edu_robot(name, aliases, availability, overview, technical, education, diff
         "differentiator": differentiator,
         "customization": customization,
         "notes": notes,
+        "image_filename": "",
     }
 
 
@@ -250,18 +255,31 @@ def _write_content(data):
 def _migrate_content(raw):
     raw = raw if isinstance(raw, dict) else {}
     old_schema = int(raw.get("schema_version", 1) or 1)
-    if old_schema >= CONTENT_SCHEMA_VERSION:
-        return _deep_merge(DEFAULT_CONTENT, raw), False
 
-    migrated = _deep_merge(DEFAULT_CONTENT, raw)
+    # v3 adds robot images + dynamic educational robots. Preserve all v2 edits.
+    if old_schema >= CONTENT_SCHEMA_VERSION:
+        data = _deep_merge(DEFAULT_CONTENT, raw)
+        for robot in (data.get("educational_robots", {}) or {}).values():
+            if isinstance(robot, dict):
+                robot.setdefault("image_filename", "")
+        return data, False
+
+    if old_schema >= 2:
+        migrated = _deep_merge(DEFAULT_CONTENT, raw)
+        robots = migrated.setdefault("educational_robots", {})
+        for robot in robots.values():
+            if isinstance(robot, dict):
+                robot.setdefault("image_filename", "")
+        migrated["schema_version"] = CONTENT_SCHEMA_VERSION
+        migrated["revision"] = int(raw.get("revision", 1) or 1) + 1
+        return migrated, True
+
     # v1 had one giant `knowledge` field. Preserve it for reference, but do not
-    # inject it into Gemini anymore because this v2 robot is educational-only.
+    # inject it into Gemini anymore because this robot is educational-only.
+    migrated = _deep_merge(DEFAULT_CONTENT, raw)
     old_knowledge = str(raw.get("knowledge", "") or "").strip()
     if old_knowledge:
         migrated["legacy_knowledge_backup"] = old_knowledge
-
-    # The role changed intentionally in v2, so old generic system instructions
-    # must not override the new educational-specialist behavior.
     migrated["system_prompt"] = DEFAULT_SYSTEM_PROMPT
     migrated["educational_robots"] = copy.deepcopy(DEFAULT_EDUCATIONAL_ROBOTS)
     migrated["sales"] = copy.deepcopy(DEFAULT_CONTENT["sales"])
@@ -333,8 +351,8 @@ def _compile_knowledge(content):
 
     lines.append("=== الروبوتات التعليمية — اختصاص كيبي التفصيلي ===")
     robots = content.get("educational_robots", {}) or {}
-    for key in DEFAULT_EDUCATIONAL_ROBOTS.keys():
-        robot = robots.get(key, {}) or {}
+    for key, robot in robots.items():
+        robot = robot if isinstance(robot, dict) else {}
         if not bool(robot.get("enabled", True)):
             continue
         name = str(robot.get("name", key)).strip()
@@ -347,6 +365,7 @@ def _compile_knowledge(content):
             "الإمكانيات التعليمية: " + str(robot.get("education", "")).strip(),
             "ما الذي يميزه عن باقي الخيارات التعليمية في الجزري: " + str(robot.get("differentiator", "")).strip(),
             "قابلية التخصيص: " + str(robot.get("customization", "")).strip(),
+            "صورة للعرض على شاشة كيبي: " + ("متوفرة" if str(robot.get("image_filename", "") or "").strip() else "غير مضافة حالياً"),
         ])
         notes = str(robot.get("notes", "") or "").strip()
         if notes:
@@ -380,7 +399,9 @@ def _compose_system_instruction(content, lang):
         str(content.get("system_prompt", "")).strip()
         + "\n\n"
         + language_rule
-        + "\n\n=== قاعدة المعرفة المدارة من لوحة التحكم ===\n"
+        + "\n\n=== قواعد عرض صور الروبوتات ===\n"
+        + "إذا طلب المستخدم أن يرى صورة أو شكل روبوت تعليمي (مثل: وريني NAO، عندك صورة G1؟، شلون شكله؟)، استخدم أداة show_robot_image ومرّر اسم الروبوت المقصود. أداة take_photo مخصصة فقط عندما يريد المستخدم من كيبي التقاط صورة بالكاميرا. إذا أداة show_robot_image رجعت أن الصورة غير متوفرة، أخبره باختصار أن صورة هذا الروبوت غير مضافة حالياً.\n"
+        + "\n=== قاعدة المعرفة المدارة من لوحة التحكم ===\n"
         + _compile_knowledge(content)
     ).strip()
 
@@ -408,6 +429,87 @@ def _create_ephemeral_token(model):
         raise RuntimeError("Gemini token response missing name")
     return token
 
+
+
+# ---------------------------------------------------------------------------
+# Educational robot image catalog
+# ---------------------------------------------------------------------------
+def _normalize_robot_lookup(value):
+    text = str(value or "").strip().lower()
+    text = text.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا").replace("ى", "ي").replace("ة", "ه")
+    text = re.sub(r"[\u064B-\u065F\u0670\u0640]", "", text)
+    text = re.sub(r"[^\w\u0600-\u06FF]+", " ", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _robot_aliases(robot_key, robot):
+    out = [robot_key, str(robot.get("name", "") or "")]
+    raw = str(robot.get("aliases", "") or "")
+    out.extend(re.split(r"[,،|/\n]+", raw))
+    return [x.strip() for x in out if str(x).strip()]
+
+
+def _find_educational_robot(content, query):
+    q = _normalize_robot_lookup(query)
+    if not q:
+        return None, None
+    robots = content.get("educational_robots", {}) or {}
+    # Exact alias/name/key first.
+    for key, robot in robots.items():
+        if not isinstance(robot, dict) or not bool(robot.get("enabled", True)):
+            continue
+        for alias in _robot_aliases(key, robot):
+            if _normalize_robot_lookup(alias) == q:
+                return key, robot
+    # Then robust containment for natural requests like "صورة جي ون".
+    best = None
+    best_len = 0
+    for key, robot in robots.items():
+        if not isinstance(robot, dict) or not bool(robot.get("enabled", True)):
+            continue
+        for alias in _robot_aliases(key, robot):
+            a = _normalize_robot_lookup(alias)
+            if len(a) >= 2 and (a in q or q in a) and len(a) > best_len:
+                best = (key, robot)
+                best_len = len(a)
+    return best if best else (None, None)
+
+
+def _safe_robot_media_name(robot_key, original_name):
+    ext = Path(str(original_name or "")).suffix.lower()
+    if ext not in {".png", ".jpg", ".jpeg", ".webp"}:
+        raise ValueError("unsupported_image_type")
+    safe_key = re.sub(r"[^a-zA-Z0-9_-]+", "_", str(robot_key or "robot")).strip("_") or "robot"
+    return f"{safe_key}_{uuid.uuid4().hex[:10]}{ext}"
+
+
+@app.route("/robot-media/<path:filename>")
+def robot_media_file(filename):
+    response = send_from_directory(str(ROBOT_MEDIA_DIR), filename, conditional=True, max_age=3600)
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
+
+
+@app.route("/api/robot/robot-image")
+def robot_image_lookup():
+    if not _robot_authorized():
+        return jsonify({"ok": False, "error": "unauthorized_robot"}), 401
+    content = _load_content()
+    query = (request.args.get("name") or request.args.get("robot") or "").strip()
+    key, robot = _find_educational_robot(content, query)
+    if not robot:
+        return jsonify({"ok": False, "error": "robot_not_found", "query": query}), 404
+    filename = str(robot.get("image_filename", "") or "").strip()
+    if not filename or not (ROBOT_MEDIA_DIR / filename).is_file():
+        return jsonify({"ok": False, "error": "image_not_configured", "robot_key": key, "robot_name": robot.get("name", key)}), 404
+    return jsonify({
+        "ok": True,
+        "robot_key": key,
+        "robot_name": robot.get("name", key),
+        "image_path": url_for("robot_media_file", filename=filename),
+        "image_url": url_for("robot_media_file", filename=filename, _external=True),
+        "display_seconds": 10,
+    })
 
 # ---------------------------------------------------------------------------
 # Health + robot bootstrap
@@ -464,7 +566,7 @@ DASHBOARD_HTML = r"""
 <!doctype html><html lang="ar" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Kebbi Education Dashboard</title>
 <style>
-:root{--p:#7a3f98;--p2:#9b58b8;--bg:#f6f5f7;--card:#fff;--text:#1d1a20;--muted:#766f7b;--line:#e8e2eb;--green:#168554;--orange:#b26900;--red:#b3261e;--shadow:0 8px 24px #3920400c}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);font-family:system-ui,"Segoe UI",Arial;color:var(--text)}button,input,textarea,select{font:inherit}.app{display:grid;grid-template-columns:270px 1fr;min-height:100vh}.side{background:#211826;color:#fff;padding:24px 16px;position:sticky;top:0;height:100vh;overflow:auto}.brand{padding:4px 10px 20px}.brand small{display:block;color:#cdbed4;font-weight:700}.brand strong{font-size:22px}.navbtn{width:100%;text-align:right;background:transparent;color:#d8cfe0;border:0;padding:12px 14px;border-radius:11px;margin:3px 0;cursor:pointer}.navbtn:hover,.navbtn.active{background:#ffffff12;color:#fff}.navbtn .ico{display:inline-block;width:27px;text-align:center}.logout{display:block;color:#dacfe0;text-decoration:none;padding:12px 14px;margin-top:20px;border-top:1px solid #ffffff18}.main{min-width:0}.topbar{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:22px 28px;background:#ffffffd9;backdrop-filter:blur(8px);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}.title h1{font-size:24px;margin:0}.title p{margin:3px 0 0;color:var(--muted);font-size:13px}.save{border:0;background:var(--p);color:#fff;font-weight:800;padding:11px 18px;border-radius:11px;cursor:pointer}.save:disabled{opacity:.55}.content{padding:24px 28px 70px;max-width:1250px;width:100%;margin:auto}.page{display:none}.page.active{display:block}.hero{background:linear-gradient(135deg,#7a3f98,#a761c1);color:#fff;border-radius:20px;padding:24px;box-shadow:var(--shadow)}.hero h2{margin:0 0 7px}.hero p{margin:0;color:#f2eaf6}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}.stat,.card{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}.stat{padding:16px}.stat b{display:block;font-size:20px}.stat span{color:var(--muted);font-size:12px}.card{padding:19px;margin:14px 0}.card h3{margin:0 0 5px}.desc{color:var(--muted);font-size:13px;margin:0 0 16px}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}label{display:block;font-weight:750;font-size:13px;margin:0 0 6px}input[type=text],textarea,select{width:100%;border:1px solid #d9d3dd;border-radius:10px;padding:11px;background:#fff;color:var(--text);outline:none}input:focus,textarea:focus,select:focus{border-color:var(--p2);box-shadow:0 0 0 3px #7a3f9812}textarea{min-height:105px;resize:vertical;line-height:1.55}.tall{min-height:220px}.field{margin-bottom:13px}.robot-search{display:flex;gap:10px;align-items:center;margin:12px 0 18px}.robot-search input{max-width:420px}.robot{background:#fff;border:1px solid var(--line);border-radius:17px;margin:12px 0;overflow:hidden}.robot-head{display:flex;align-items:center;gap:12px;padding:15px 17px;cursor:pointer}.robot-head:hover{background:#fbf9fc}.robot-name{font-weight:900;flex:1}.badge{font-size:11px;padding:5px 9px;border-radius:99px;background:#eee8f1;color:#5d3c6b}.badge.order{background:#fff3dc;color:#8d5700}.switch{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}.robot-body{display:none;padding:2px 17px 18px;border-top:1px solid var(--line)}.robot.open .robot-body{display:block}.chev{transition:.2s}.robot.open .chev{transform:rotate(180deg)}.smallbtn{border:1px solid #d9d1de;background:#fff;color:#4d4453;border-radius:9px;padding:8px 11px;cursor:pointer}.danger{color:var(--red);border-color:#efc7c4}.section-title{display:flex;justify-content:space-between;align-items:end;gap:12px;margin-bottom:14px}.section-title h2{margin:0}.section-title p{margin:4px 0 0;color:var(--muted)}.notice{padding:13px 15px;border-radius:12px;background:#f0eaf4;border:1px solid #e1d4e7;color:#553661}.ok{background:#e9f7ef;border-color:#c7ead7;color:#126f48}.warn{background:#fff8e8;border-color:#f5e2b8;color:#805b05}.sticky-status{position:fixed;left:24px;bottom:22px;background:#1f1923;color:#fff;padding:11px 14px;border-radius:11px;box-shadow:0 8px 24px #0003;display:none;z-index:50}.preview{white-space:pre-wrap;direction:rtl;background:#1f1d22;color:#eee;padding:15px;border-radius:12px;max-height:520px;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.6}.muted{color:var(--muted)}@media(max-width:950px){.app{grid-template-columns:1fr}.side{position:static;height:auto}.side .brand{padding-bottom:8px}.nav{display:flex;overflow:auto;gap:4px}.navbtn{min-width:max-content;text-align:center}.logout{border:0;margin:0}.topbar{top:0}.stats{grid-template-columns:1fr 1fr}.grid3{grid-template-columns:1fr 1fr}}@media(max-width:650px){.content,.topbar{padding-left:15px;padding-right:15px}.grid2,.grid3,.stats{grid-template-columns:1fr}.topbar{align-items:flex-start}.title h1{font-size:20px}}
+:root{--p:#7a3f98;--p2:#9b58b8;--bg:#f6f5f7;--card:#fff;--text:#1d1a20;--muted:#766f7b;--line:#e8e2eb;--green:#168554;--orange:#b26900;--red:#b3261e;--shadow:0 8px 24px #3920400c}*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);font-family:system-ui,"Segoe UI",Arial;color:var(--text)}button,input,textarea,select{font:inherit}.app{display:grid;grid-template-columns:270px 1fr;min-height:100vh}.side{background:#211826;color:#fff;padding:24px 16px;position:sticky;top:0;height:100vh;overflow:auto}.brand{padding:4px 10px 20px}.brand small{display:block;color:#cdbed4;font-weight:700}.brand strong{font-size:22px}.navbtn{width:100%;text-align:right;background:transparent;color:#d8cfe0;border:0;padding:12px 14px;border-radius:11px;margin:3px 0;cursor:pointer}.navbtn:hover,.navbtn.active{background:#ffffff12;color:#fff}.navbtn .ico{display:inline-block;width:27px;text-align:center}.logout{display:block;color:#dacfe0;text-decoration:none;padding:12px 14px;margin-top:20px;border-top:1px solid #ffffff18}.main{min-width:0}.topbar{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:22px 28px;background:#ffffffd9;backdrop-filter:blur(8px);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:20}.title h1{font-size:24px;margin:0}.title p{margin:3px 0 0;color:var(--muted);font-size:13px}.save{border:0;background:var(--p);color:#fff;font-weight:800;padding:11px 18px;border-radius:11px;cursor:pointer}.save:disabled{opacity:.55}.content{padding:24px 28px 70px;max-width:1250px;width:100%;margin:auto}.page{display:none}.page.active{display:block}.hero{background:linear-gradient(135deg,#7a3f98,#a761c1);color:#fff;border-radius:20px;padding:24px;box-shadow:var(--shadow)}.hero h2{margin:0 0 7px}.hero p{margin:0;color:#f2eaf6}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0}.stat,.card{background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}.stat{padding:16px}.stat b{display:block;font-size:20px}.stat span{color:var(--muted);font-size:12px}.card{padding:19px;margin:14px 0}.card h3{margin:0 0 5px}.desc{color:var(--muted);font-size:13px;margin:0 0 16px}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px}.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}label{display:block;font-weight:750;font-size:13px;margin:0 0 6px}input[type=text],textarea,select{width:100%;border:1px solid #d9d3dd;border-radius:10px;padding:11px;background:#fff;color:var(--text);outline:none}input:focus,textarea:focus,select:focus{border-color:var(--p2);box-shadow:0 0 0 3px #7a3f9812}textarea{min-height:105px;resize:vertical;line-height:1.55}.tall{min-height:220px}.field{margin-bottom:13px}.robot-search{display:flex;gap:10px;align-items:center;margin:12px 0 18px}.robot-search input{max-width:420px}.robot{background:#fff;border:1px solid var(--line);border-radius:17px;margin:12px 0;overflow:hidden}.robot-head{display:flex;align-items:center;gap:12px;padding:15px 17px;cursor:pointer}.robot-head:hover{background:#fbf9fc}.robot-name{font-weight:900;flex:1}.badge{font-size:11px;padding:5px 9px;border-radius:99px;background:#eee8f1;color:#5d3c6b}.badge.order{background:#fff3dc;color:#8d5700}.switch{display:inline-flex;align-items:center;gap:6px;color:var(--muted);font-size:12px}.robot-body{display:none;padding:2px 17px 18px;border-top:1px solid var(--line)}.robot.open .robot-body{display:block}.chev{transition:.2s}.robot.open .chev{transform:rotate(180deg)}.smallbtn{border:1px solid #d9d1de;background:#fff;color:#4d4453;border-radius:9px;padding:8px 11px;cursor:pointer}.danger{color:var(--red);border-color:#efc7c4}.section-title{display:flex;justify-content:space-between;align-items:end;gap:12px;margin-bottom:14px}.section-title h2{margin:0}.section-title p{margin:4px 0 0;color:var(--muted)}.notice{padding:13px 15px;border-radius:12px;background:#f0eaf4;border:1px solid #e1d4e7;color:#553661}.ok{background:#e9f7ef;border-color:#c7ead7;color:#126f48}.warn{background:#fff8e8;border-color:#f5e2b8;color:#805b05}.sticky-status{position:fixed;left:24px;bottom:22px;background:#1f1923;color:#fff;padding:11px 14px;border-radius:11px;box-shadow:0 8px 24px #0003;display:none;z-index:50}.preview{white-space:pre-wrap;direction:rtl;background:#1f1d22;color:#eee;padding:15px;border-radius:12px;max-height:520px;overflow:auto;font-family:ui-monospace,Consolas,monospace;font-size:12px;line-height:1.6}.muted{color:var(--muted)}.robot-media{display:grid;grid-template-columns:150px 1fr;gap:14px;align-items:center;background:#faf8fb;border:1px dashed #dccfe2;border-radius:13px;padding:12px;margin:12px 0}.robot-thumb{width:150px;height:110px;object-fit:contain;background:#17151a;border-radius:10px}.media-actions{display:flex;flex-wrap:wrap;gap:8px;align-items:center}.media-actions input[type=file]{max-width:290px}.addbtn{border:0;background:#ede3f2;color:#65377a;font-weight:800;padding:10px 14px;border-radius:10px;cursor:pointer}.ghost-danger{border:1px solid #efc7c4;background:#fff;color:var(--red);padding:8px 11px;border-radius:9px;cursor:pointer}@media(max-width:950px){.app{grid-template-columns:1fr}.side{position:static;height:auto}.side .brand{padding-bottom:8px}.nav{display:flex;overflow:auto;gap:4px}.navbtn{min-width:max-content;text-align:center}.logout{border:0;margin:0}.topbar{top:0}.stats{grid-template-columns:1fr 1fr}.grid3{grid-template-columns:1fr 1fr}}@media(max-width:650px){.content,.topbar{padding-left:15px;padding-right:15px}.grid2,.grid3,.stats{grid-template-columns:1fr}.topbar{align-items:flex-start}.title h1{font-size:20px}}
 </style></head>
 <body><div class="app">
 <aside class="side"><div class="brand"><small>AL JAZARI</small><strong>Kebbi Education</strong></div><div class="nav">
@@ -483,13 +585,13 @@ DASHBOARD_HTML = r"""
 
 <section class="page" id="page-sales"><div class="section-title"><div><h2>المبيعات والأسعار</h2><p>الرقم مفصول وحده حتى تغيّره بأي وقت بدون تعديل باقي قاعدة المعرفة.</p></div></div><div class="card"><div class="grid2"><div class="field"><label>رقم قسم المبيعات</label><input id="sales_phone" type="text" inputmode="tel"></div><div class="notice warn">كيبي ما تعطي أسعار. تسأل الزائر أولاً: «تحب أنطيك رقمهم؟» وبعد الموافقة تعطي الرقم.</div></div><div class="field"><label>سياسة التعامل مع أسئلة الأسعار</label><textarea id="sales_price_policy"></textarea></div></div></section>
 
-<section class="page" id="page-edu"><div class="section-title"><div><h2>الروبوتات التعليمية</h2><p>اضغط على أي روبوت حتى تعدل معلوماته التقنية والتعليمية بشكل مستقل.</p></div></div><div class="robot-search"><input id="robotSearch" type="text" placeholder="ابحث: NAO، JetArm، G1..." oninput="filterRobots()"><span class="muted">تعطيل الروبوت يخفيه من قاعدة معرفة Gemini بدون حذف بياناته.</span></div><div id="robotsContainer"></div></section>
+<section class="page" id="page-edu"><div class="section-title"><div><h2>الروبوتات التعليمية</h2><p>اضغط على أي روبوت حتى تعدل معلوماته التقنية والتعليمية وصورته بشكل مستقل.</p></div><button class="addbtn" onclick="addRobot()">＋ إضافة روبوت</button></div><div class="robot-search"><input id="robotSearch" type="text" placeholder="ابحث: NAO، JetArm، G1..." oninput="filterRobots()"><span class="muted">تعطيل الروبوت يخفيه من قاعدة معرفة Gemini بدون حذف بياناته.</span></div><div id="robotsContainer"></div></section>
 
 <section class="page" id="page-other"><div class="section-title"><div><h2>بقية روبوتات الجزري</h2><p>معلومات عامة فقط + تحويل للروبوت المسؤول عن التفاصيل.</p></div></div><div id="otherGroups"></div></section>
 
 <section class="page" id="page-voice"><div class="section-title"><div><h2>الصوت والترحيب</h2><p>هذه الإعدادات لا تغيّر منطق اللغة داخل التطبيق؛ التطبيق يبقى عربي أساسي وإنكليزي من الزر فقط.</p></div></div><div class="card"><div class="grid2"><div class="field"><label>Gemini Voice</label><select id="voice_name"><option>Aoede</option><option>Kore</option><option>Achird</option><option>Sulafat</option><option>Puck</option><option>Charon</option><option>Leda</option></select></div><div></div><div class="field"><label>الترحيب العربي</label><textarea id="greeting_ar"></textarea></div><div class="field"><label>English greeting</label><textarea id="greeting_en" dir="ltr"></textarea></div></div></div></section>
 
-<section class="page" id="page-advanced"><div class="section-title"><div><h2>إعدادات متقدمة</h2><p>لا تحتاج تدخل هنا بالتعديل اليومي. المعلومات التفصيلية للروبوتات مو موجودة بهذا الحقل.</p></div></div><div class="card"><label>System Prompt — قواعد السلوك فقط</label><textarea class="tall" id="system_prompt"></textarea></div><div class="card"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><div><h3>معاينة قاعدة المعرفة الفعلية</h3><p class="desc">هذا النص هو المحتوى المنظّم الذي يندمج تلقائياً مع البرومبت عند اتصال كيبي.</p></div><button class="smallbtn" onclick="loadPreview()">تحديث المعاينة</button></div><div id="knowledgePreview" class="preview">اضغط «تحديث المعاينة»</div></div><div class="card"><h3>بيانات Legacy محفوظة</h3><p class="desc">عند الترقية من النسخة القديمة نحفظ الـKnowledge القديم هنا كنسخة احتياطية فقط، لكنه لا يرسل إلى Gemini.</p><textarea id="legacy_knowledge_backup" class="tall" readonly></textarea></div><div class="card"><b>حالة السيرفر:</b> Gemini configured = {{gemini_ok}} | Schema = 2</div></section>
+<section class="page" id="page-advanced"><div class="section-title"><div><h2>إعدادات متقدمة</h2><p>لا تحتاج تدخل هنا بالتعديل اليومي. المعلومات التفصيلية للروبوتات مو موجودة بهذا الحقل.</p></div></div><div class="card"><label>System Prompt — قواعد السلوك فقط</label><textarea class="tall" id="system_prompt"></textarea></div><div class="card"><div style="display:flex;justify-content:space-between;gap:10px;align-items:center"><div><h3>معاينة قاعدة المعرفة الفعلية</h3><p class="desc">هذا النص هو المحتوى المنظّم الذي يندمج تلقائياً مع البرومبت عند اتصال كيبي.</p></div><button class="smallbtn" onclick="loadPreview()">تحديث المعاينة</button></div><div id="knowledgePreview" class="preview">اضغط «تحديث المعاينة»</div></div><div class="card"><h3>بيانات Legacy محفوظة</h3><p class="desc">عند الترقية من النسخة القديمة نحفظ الـKnowledge القديم هنا كنسخة احتياطية فقط، لكنه لا يرسل إلى Gemini.</p><textarea id="legacy_knowledge_backup" class="tall" readonly></textarea></div><div class="card"><b>حالة السيرفر:</b> Gemini configured = {{gemini_ok}} | Schema = 3</div></section>
 </div></main></div><div class="sticky-status" id="statusToast"></div>
 <script>
 let DATA=null;
@@ -500,16 +602,24 @@ function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&l
 function toast(msg,ok=true){const e=document.getElementById('statusToast');e.textContent=msg;e.style.display='block';e.style.background=ok?'#1f1923':'#8c1d18';clearTimeout(window._tt);window._tt=setTimeout(()=>e.style.display='none',2600)}
 function switchPage(name){document.querySelectorAll('.page').forEach(e=>e.classList.remove('active'));document.querySelectorAll('.navbtn').forEach(e=>e.classList.remove('active'));document.getElementById('page-'+name).classList.add('active');document.querySelector(`.navbtn[data-page="${name}"]`).classList.add('active');document.getElementById('pageTitle').textContent=pageNames[name]||name;if(name==='advanced')loadPreview()}
 document.querySelectorAll('.navbtn').forEach(b=>b.onclick=()=>switchPage(b.dataset.page));
-function robotCard(key,r){const order=(r.availability||'').includes('الطلب');return `<div class="robot" data-key="${esc(key)}" data-search="${esc((r.name||'')+' '+(r.aliases||''))}"><div class="robot-head" onclick="this.parentElement.classList.toggle('open')"><span class="chev">⌄</span><span class="robot-name">${esc(r.name||key)}</span><span class="badge ${order?'order':''}">${order?'حسب الطلب':'متوفر'}</span><label class="switch" onclick="event.stopPropagation()"><input type="checkbox" class="r-enabled" ${r.enabled!==false?'checked':''}> مفعّل</label></div><div class="robot-body"><div class="grid2"><div class="field"><label>الاسم</label><input class="r-name" value="${esc(r.name)}"></div><div class="field"><label>الأسماء البديلة</label><input class="r-aliases" value="${esc(r.aliases)}"></div></div><div class="field"><label>التوفر في الجزري</label><textarea class="r-availability">${esc(r.availability)}</textarea></div><div class="field"><label>نبذة</label><textarea class="r-overview">${esc(r.overview)}</textarea></div><div class="field"><label>المعلومات التقنية</label><textarea class="r-technical">${esc(r.technical)}</textarea></div><div class="field"><label>الإمكانيات التعليمية</label><textarea class="r-education">${esc(r.education)}</textarea></div><div class="field"><label>شنو يميزه عن البقية؟</label><textarea class="r-differentiator">${esc(r.differentiator)}</textarea></div><div class="field"><label>قابلية التخصيص</label><textarea class="r-customization">${esc(r.customization)}</textarea></div><div class="field"><label>ملاحظات إضافية</label><textarea class="r-notes">${esc(r.notes)}</textarea></div><button class="smallbtn danger" onclick="clearRobot(event,'${esc(key)}')">مسح محتوى هذا القسم وتعطيله</button></div></div>`}
+function robotImageSrc(r){return r&&r.image_filename?('/robot-media/'+encodeURIComponent(r.image_filename)):''}
+function robotCard(key,r){const order=(r.availability||'').includes('الطلب');const img=robotImageSrc(r);return `<div class="robot" data-key="${esc(key)}" data-search="${esc((r.name||'')+' '+(r.aliases||''))}"><div class="robot-head" onclick="this.parentElement.classList.toggle('open')"><span class="chev">⌄</span><span class="robot-name">${esc(r.name||key)}</span><span class="badge ${order?'order':''}">${order?'حسب الطلب':'متوفر'}</span><label class="switch" onclick="event.stopPropagation()"><input type="checkbox" class="r-enabled" ${r.enabled!==false?'checked':''}> مفعّل</label></div><div class="robot-body"><div class="grid2"><div class="field"><label>الاسم</label><input class="r-name" value="${esc(r.name)}"></div><div class="field"><label>الأسماء البديلة</label><input class="r-aliases" value="${esc(r.aliases)}"></div></div><div class="robot-media"><div>${img?`<img class="robot-thumb" src="${esc(img)}?v=${DATA.revision||1}" alt="${esc(r.name||key)}">`:`<div class="robot-thumb" style="display:grid;place-items:center;color:#aaa">لا توجد صورة</div>`}</div><div><b>صورة الروبوت على شاشة كيبي</b><p class="desc">إذا الزائر طلب صورة هذا الروبوت، كيبي تعرض الصورة 10 ثواني وترجع للوجه.</p><div class="media-actions"><input class="r-image-file" type="file" accept="image/png,image/jpeg,image/webp"><button class="smallbtn" onclick="uploadRobotImage(event,'${esc(key)}')">رفع/تغيير الصورة</button>${img?`<button class="ghost-danger" onclick="deleteRobotImage(event,'${esc(key)}')">حذف الصورة</button>`:''}</div></div></div><div class="field"><label>التوفر في الجزري</label><textarea class="r-availability">${esc(r.availability)}</textarea></div><div class="field"><label>نبذة</label><textarea class="r-overview">${esc(r.overview)}</textarea></div><div class="field"><label>المعلومات التقنية</label><textarea class="r-technical">${esc(r.technical)}</textarea></div><div class="field"><label>الإمكانيات التعليمية</label><textarea class="r-education">${esc(r.education)}</textarea></div><div class="field"><label>شنو يميزه عن البقية؟</label><textarea class="r-differentiator">${esc(r.differentiator)}</textarea></div><div class="field"><label>قابلية التخصيص</label><textarea class="r-customization">${esc(r.customization)}</textarea></div><div class="field"><label>ملاحظات إضافية</label><textarea class="r-notes">${esc(r.notes)}</textarea></div><div class="media-actions"><button class="smallbtn danger" onclick="clearRobot(event,'${esc(key)}')">مسح المحتوى وتعطيله</button>${Object.prototype.hasOwnProperty.call(DEFAULT_KEYS,key)?'':`<button class="ghost-danger" onclick="removeCustomRobot(event,'${esc(key)}')">حذف الروبوت المضاف</button>`}</div></div></div>`}
 function groupCard(key,g){return `<div class="card other-group" data-key="${esc(key)}"><div style="display:flex;justify-content:space-between;gap:10px"><h3>${esc(g.title||key)}</h3><label class="switch"><input type="checkbox" class="g-enabled" ${g.enabled!==false?'checked':''}> مفعّل</label></div><div class="field"><label>اسم الفئة</label><input class="g-title" value="${esc(g.title)}"></div><div class="field"><label>الروبوتات/النماذج</label><textarea class="g-robots">${esc(g.robots)}</textarea></div><div class="field"><label>معلومات عامة فقط</label><textarea class="g-general_info">${esc(g.general_info)}</textarea></div><div class="grid2"><div class="field"><label>الروبوت المسؤول عن التفاصيل</label><input class="g-refer_to" value="${esc(g.refer_to)}"></div><div class="field"><label>صيغة التحويل</label><textarea class="g-referral_text">${esc(g.referral_text)}</textarea></div></div></div>`}
+let DEFAULT_KEYS={nao:1,jetarm:1,jetauto:1,ugot:1,ukit:1,kebbi:1,unitree_g1_edu:1,booster_k1_edu:1};
 function renderStructured(){const rc=document.getElementById('robotsContainer');rc.innerHTML='';Object.entries(DATA.educational_robots||{}).forEach(([k,r])=>rc.insertAdjacentHTML('beforeend',robotCard(k,r)));const og=document.getElementById('otherGroups');og.innerHTML='';Object.entries(DATA.other_robot_groups||{}).forEach(([k,g])=>og.insertAdjacentHTML('beforeend',groupCard(k,g)));updateStats()}
 function updateStats(){const active=Object.values(DATA?.educational_robots||{}).filter(x=>x.enabled!==false).length;document.getElementById('statActive').textContent=active;document.getElementById('statRev').textContent=DATA?.revision??'—';document.getElementById('statPhone').textContent=DATA?.sales?.phone||'—'}
 function fillBase(){for(const k of ['company_name','robot_name','voice_name','greeting_ar','greeting_en','system_prompt','company_general','legacy_knowledge_backup']){const e=document.getElementById(k);if(e)e.value=DATA[k]??''}document.getElementById('role_title').value=DATA.role?.title||'';document.getElementById('role_summary').value=DATA.role?.summary||'';document.getElementById('role_style').value=DATA.role?.style||'';document.getElementById('sales_phone').value=DATA.sales?.phone||'';document.getElementById('sales_price_policy').value=DATA.sales?.price_policy||''}
 async function loadAll(){const r=await fetch('/api/admin/content');if(!r.ok){location='/login';return}DATA=await r.json();fillBase();renderStructured()}
 function collect(){DATA.company_name=document.getElementById('company_name').value;DATA.robot_name=document.getElementById('robot_name').value;DATA.voice_name=document.getElementById('voice_name').value;DATA.greeting_ar=document.getElementById('greeting_ar').value;DATA.greeting_en=document.getElementById('greeting_en').value;DATA.system_prompt=document.getElementById('system_prompt').value;DATA.company_general=document.getElementById('company_general').value;DATA.role={title:document.getElementById('role_title').value,summary:document.getElementById('role_summary').value,style:document.getElementById('role_style').value};DATA.sales={phone:document.getElementById('sales_phone').value,price_policy:document.getElementById('sales_price_policy').value};document.querySelectorAll('.robot').forEach(el=>{const k=el.dataset.key;const r=DATA.educational_robots[k]||{};r.enabled=el.querySelector('.r-enabled').checked;ROBOT_FIELDS.forEach(f=>r[f]=el.querySelector('.r-'+f).value);DATA.educational_robots[k]=r});document.querySelectorAll('.other-group').forEach(el=>{const k=el.dataset.key;const g=DATA.other_robot_groups[k]||{};g.enabled=el.querySelector('.g-enabled').checked;OTHER_FIELDS.forEach(f=>g[f]=el.querySelector('.g-'+f).value);DATA.other_robot_groups[k]=g});return DATA}
-async function saveAll(){const b=document.getElementById('saveBtn');b.disabled=true;b.textContent='جاري الحفظ...';try{const r=await fetch('/api/admin/content',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect())});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'save failed');toast('تم الحفظ ✓');await loadAll()}catch(e){toast('فشل الحفظ: '+e.message,false)}finally{b.disabled=false;b.textContent='حفظ التغييرات'}}
+async function postContent(reload=true){const r=await fetch('/api/admin/content',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collect())});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'save failed');if(reload)await loadAll();return d}
+async function saveAll(){const b=document.getElementById('saveBtn');b.disabled=true;b.textContent='جاري الحفظ...';try{await postContent(true);toast('تم الحفظ ✓')}catch(e){toast('فشل الحفظ: '+e.message,false)}finally{b.disabled=false;b.textContent='حفظ التغييرات'}}
 function filterRobots(){const q=document.getElementById('robotSearch').value.trim().toLowerCase();document.querySelectorAll('.robot').forEach(e=>e.style.display=(!q||e.dataset.search.toLowerCase().includes(q))?'block':'none')}
 function clearRobot(ev,key){ev.stopPropagation();if(!confirm('متأكد تريد تمسح محتوى هذا الروبوت وتعطله من قاعدة المعرفة؟'))return;const el=document.querySelector(`.robot[data-key="${key}"]`);el.querySelector('.r-enabled').checked=false;ROBOT_FIELDS.forEach(f=>el.querySelector('.r-'+f).value='');el.classList.add('open')}
+function makeRobotKey(name){let base=String(name||'robot').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'');if(!base)base='robot_'+Date.now();let k=base,n=2;while(DATA.educational_robots[k])k=base+'_'+(n++);return k}
+function addRobot(){const name=prompt('اسم الروبوت الجديد:');if(!name||!name.trim())return;const key=makeRobotKey(name.trim());DATA.educational_robots[key]={enabled:true,name:name.trim(),aliases:name.trim(),availability:'',overview:'',technical:'',education:'',differentiator:'',customization:'',notes:'',image_filename:''};renderStructured();const el=document.querySelector(`.robot[data-key="${key}"]`);if(el){el.classList.add('open');el.scrollIntoView({behavior:'smooth',block:'start'})}toast('تمت إضافة الروبوت محلياً — اضغط حفظ التغييرات')}
+async function uploadRobotImage(ev,key){ev.stopPropagation();const el=document.querySelector(`.robot[data-key="${key}"]`);const input=el&&el.querySelector('.r-image-file');const file=input&&input.files&&input.files[0];if(!file){toast('اختار صورة أولاً',false);return}try{toast('جاري حفظ البيانات ورفع الصورة...');await postContent(false);const fd=new FormData();fd.append('image',file);const r=await fetch('/api/admin/robots/'+encodeURIComponent(key)+'/image',{method:'POST',body:fd});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'upload failed');toast('تم رفع صورة الروبوت ✓');await loadAll()}catch(e){toast('فشل رفع الصورة: '+e.message,false)}}
+async function deleteRobotImage(ev,key){ev.stopPropagation();if(!confirm('حذف صورة هذا الروبوت؟'))return;try{const r=await fetch('/api/admin/robots/'+encodeURIComponent(key)+'/image',{method:'DELETE'});const d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'delete failed');toast('تم حذف الصورة');await loadAll()}catch(e){toast('فشل حذف الصورة: '+e.message,false)}}
+async function removeCustomRobot(ev,key){ev.stopPropagation();if(!confirm('حذف هذا الروبوت المضاف من القائمة؟'))return;delete DATA.educational_robots[key];renderStructured();try{await postContent(true);toast('تم حذف الروبوت')}catch(e){toast('فشل الحذف: '+e.message,false)}}
 async function loadPreview(){const e=document.getElementById('knowledgePreview');e.textContent='جاري التحميل...';try{const r=await fetch('/api/admin/knowledge-preview');const d=await r.json();e.textContent=d.knowledge||'لا يوجد محتوى'}catch(err){e.textContent='تعذر تحميل المعاينة'}}
 loadAll();
 </script></body></html>
@@ -585,21 +695,43 @@ def admin_content():
             if key in incoming["sales"]:
                 old["sales"][key] = str(incoming["sales"].get(key) or "")
 
-    # Fixed educational robot registry; sections can be enabled/disabled and edited independently.
+    # Dynamic educational robot registry. Built-in robots stay available by default,
+    # and admins can add extra robots from the dashboard without code changes.
     if isinstance(incoming.get("educational_robots"), dict):
-        old.setdefault("educational_robots", {})
-        for robot_key in DEFAULT_EDUCATIONAL_ROBOTS.keys():
-            src = incoming["educational_robots"].get(robot_key)
+        current = old.get("educational_robots", {}) or {}
+        next_robots = {}
+        for robot_key, src in incoming["educational_robots"].items():
             if not isinstance(src, dict):
                 continue
-            dst = old["educational_robots"].setdefault(robot_key, copy.deepcopy(DEFAULT_EDUCATIONAL_ROBOTS[robot_key]))
-            if "enabled" in src:
-                dst["enabled"] = bool(src.get("enabled"))
+            key = str(robot_key or "").strip()
+            if not key or len(key) > 80:
+                continue
+            previous = current.get(key, {}) if isinstance(current.get(key), dict) else {}
+            dst = {
+                "enabled": bool(src.get("enabled", True)),
+                "image_filename": str(previous.get("image_filename", src.get("image_filename", "")) or ""),
+            }
             for field in EDU_ROBOT_FIELDS:
                 if field == "enabled":
                     continue
-                if field in src:
-                    dst[field] = str(src.get(field) or "")
+                dst[field] = str(src.get(field, previous.get(field, "")) or "")
+            next_robots[key] = dst
+        # Never silently drop built-ins if a stale dashboard payload omits them.
+        for key, default_robot in DEFAULT_EDUCATIONAL_ROBOTS.items():
+            if key not in next_robots:
+                next_robots[key] = copy.deepcopy(current.get(key, default_robot))
+                next_robots[key].setdefault("image_filename", "")
+        # Clean image files belonging to custom robots that were removed from the dashboard.
+        for removed_key, removed_robot in current.items():
+            if removed_key in next_robots or not isinstance(removed_robot, dict):
+                continue
+            old_image = str(removed_robot.get("image_filename", "") or "").strip()
+            if old_image:
+                try:
+                    (ROBOT_MEDIA_DIR / old_image).unlink(missing_ok=True)
+                except Exception:
+                    pass
+        old["educational_robots"] = next_robots
 
     if isinstance(incoming.get("other_robot_groups"), dict):
         old.setdefault("other_robot_groups", {})
@@ -617,6 +749,56 @@ def admin_content():
     saved = _save_content(old)
     return jsonify({"ok": True, "revision": saved["revision"]})
 
+
+
+@app.route("/api/admin/robots/<robot_key>/image", methods=["POST", "DELETE"])
+@_admin_required
+def admin_robot_image(robot_key):
+    content = _load_content()
+    robots = content.get("educational_robots", {}) or {}
+    robot = robots.get(robot_key)
+    if not isinstance(robot, dict):
+        return jsonify({"ok": False, "error": "robot_not_found"}), 404
+
+    old_filename = str(robot.get("image_filename", "") or "").strip()
+    if request.method == "DELETE":
+        if old_filename:
+            try:
+                (ROBOT_MEDIA_DIR / old_filename).unlink(missing_ok=True)
+            except Exception:
+                pass
+        robot["image_filename"] = ""
+        saved = _save_content(content)
+        return jsonify({"ok": True, "revision": saved.get("revision")})
+
+    uploaded = request.files.get("image")
+    if uploaded is None or not uploaded.filename:
+        return jsonify({"ok": False, "error": "missing_image"}), 400
+    # 12 MB is more than enough for a full-screen robot product image.
+    uploaded.stream.seek(0, os.SEEK_END)
+    size = uploaded.stream.tell()
+    uploaded.stream.seek(0)
+    if size <= 0 or size > 12 * 1024 * 1024:
+        return jsonify({"ok": False, "error": "image_too_large", "max_mb": 12}), 400
+    try:
+        filename = _safe_robot_media_name(robot_key, uploaded.filename)
+    except ValueError as e:
+        return jsonify({"ok": False, "error": str(e)}), 400
+
+    target = ROBOT_MEDIA_DIR / filename
+    uploaded.save(str(target))
+    if old_filename and old_filename != filename:
+        try:
+            (ROBOT_MEDIA_DIR / old_filename).unlink(missing_ok=True)
+        except Exception:
+            pass
+    robot["image_filename"] = filename
+    saved = _save_content(content)
+    return jsonify({
+        "ok": True,
+        "revision": saved.get("revision"),
+        "image_url": url_for("robot_media_file", filename=filename, _external=True),
+    })
 
 # ---------------------------------------------------------------------------
 # Existing call signaling + WebRTC routing (kept compatible with current app)
